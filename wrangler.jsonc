@@ -1,0 +1,8 @@
+{
+  "name": "todoist-autoassign",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "routes": [{ "pattern": "todoist-hook.vassilyv.me", "custom_domain": true }],
+  "kv_namespaces": [{ "binding": "KV", "id": "645711fe87ac4d218ffc5f05307ba9fd" }],
+  "vars": { "TARGET_PROJECT_ID": "6j2Mq6hWq4h7vgv7" }
+}
