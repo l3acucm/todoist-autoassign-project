@@ -3,6 +3,8 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",
   "routes": [{ "pattern": "todoist-hook.vassilyv.me", "custom_domain": true }],
-  "kv_namespaces": [{ "binding": "KV", "id": "645711fe87ac4d218ffc5f05307ba9fd" }],
+  "durable_objects": { "bindings": [{ "name": "TOKENS", "class_name": "TokenStore" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["TokenStore"] }],
+  "observability": { "enabled": true },
   "vars": { "TARGET_PROJECT_ID": "6j2Mq6hWq4h7vgv7" }
 }

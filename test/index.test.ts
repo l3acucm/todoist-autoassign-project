@@ -1,13 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
-import worker, { needsMove } from "../src/index";
+import worker, { needsMove, TokenStore } from "../src/index";
 
 const T = "target";
-const env: any = {
-  KV: { get: async () => "tok", put: vi.fn() },
-  TODOIST_APP_CLIENT_ID: "id",
-  TODOIST_APP_CLIENT_SECRET: "secret",
-  TARGET_PROJECT_ID: T,
-};
+const creds = { TODOIST_APP_CLIENT_ID: "id", TODOIST_APP_CLIENT_SECRET: "secret", TARGET_PROJECT_ID: T };
+
+/** Real TokenStore over an in-memory storage, wired like a Durable Object binding. */
+function makeEnv(saved?: object) {
+  const data = new Map<string, any>(saved ? [["oauth", saved]] : []);
+  const state: any = { storage: { get: async (k: string) => data.get(k), put: async (k: string, v: any) => void data.set(k, v) } };
+  const store = new TokenStore(state, creds as any);
+  const env: any = { ...creds, TOKENS: { idFromName: () => "id", get: () => ({ fetch: (u: string, i?: RequestInit) => store.fetch(new Request(u, i)) }) } };
+  return { env, data };
+}
+const fresh = () => ({ access_token: "tok", refresh_token: "r1", expires_at: Date.now() + 3_600_000 });
+const expired = () => ({ access_token: "old", refresh_token: "r1", expires_at: Date.now() - 1 });
+
 const ev = (name = "item:added", extra: object = {}) => ({ event_name: name, event_data: { id: "1", project_id: "other", parent_id: null, ...extra } });
 
 async function sign(body: string) {
@@ -15,7 +22,7 @@ async function sign(body: string) {
   return btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(body)))));
 }
 
-async function post(payload: object, sig?: string) {
+async function post(payload: object, sig?: string, env = makeEnv(fresh()).env) {
   const body = JSON.stringify(payload);
   const waits: Promise<unknown>[] = [];
   const res = await worker.fetch(
@@ -55,14 +62,44 @@ describe("webhook", () => {
 describe("oauth", () => {
   it("callback rejects forged state; start redirects with signed state", async () => {
     const ctx: any = {};
+    const { env, data } = makeEnv();
     expect((await worker.fetch(new Request("https://x/oauth/callback?code=c&state=bad.bad"), env, ctx)).status).toBe(400);
     const r = await worker.fetch(new Request("https://x/oauth/start"), env, ctx);
     const loc = new URL(r.headers.get("location")!);
     expect(loc.searchParams.get("client_id")).toBe("id");
     const state = loc.searchParams.get("state")!;
-    vi.stubGlobal("fetch", async () => Response.json({ access_token: "newtok" }));
+    vi.stubGlobal("fetch", async () => Response.json({ access_token: "newtok", refresh_token: "newref", expires_in: 3600 }));
     const ok = await worker.fetch(new Request(`https://x/oauth/callback?code=c&state=${state}`), env, ctx);
     expect(ok.status).toBe(200);
-    expect(env.KV.put).toHaveBeenCalledWith("access_token", "newtok");
+    expect(data.get("oauth")).toMatchObject({ access_token: "newtok", refresh_token: "newref" });
+    expect(data.get("oauth").expires_at).toBeGreaterThan(Date.now() + 3_500_000);
+  });
+});
+
+describe("token refresh", () => {
+  const todoist = (refresh: () => Response) =>
+    vi.fn(async (u: string, _init?: RequestInit) => (u.endsWith("/oauth/access_token") ? refresh() : new Response("{}")));
+
+  it("refreshes an expired token once for concurrent webhooks and keeps the rotated refresh token", async () => {
+    const f = todoist(() => Response.json({ access_token: "new", refresh_token: "r2", expires_in: 3600 }));
+    vi.stubGlobal("fetch", f);
+    const { env, data } = makeEnv(expired());
+    await Promise.all([post(ev(), undefined, env), post(ev("item:added", { id: "2" }), undefined, env)]);
+    const refreshes = f.mock.calls.filter(([u]) => u.endsWith("/oauth/access_token"));
+    expect(refreshes).toHaveLength(1);
+    expect(String(refreshes[0][1]!.body)).toContain("grant_type=refresh_token");
+    const moves = f.mock.calls.filter(([u]) => u.endsWith("/move"));
+    expect(moves.map(([, i]) => (i!.headers as any).Authorization)).toEqual(["Bearer new", "Bearer new"]);
+    expect(data.get("oauth").refresh_token).toBe("r2");
+  });
+
+  it("reports unauthorized and does not move when refresh fails", async () => {
+    const f = todoist(() => new Response("{}", { status: 400 }));
+    vi.stubGlobal("fetch", f);
+    const { env } = makeEnv(expired());
+    await post(ev(), undefined, env);
+    expect(f.mock.calls.filter(([u]) => u.endsWith("/move"))).toHaveLength(0);
+    const h = await worker.fetch(new Request("https://x/health"), env, {} as any);
+    expect(await h.json()).toMatchObject({ authorized: false });
   });
 });
